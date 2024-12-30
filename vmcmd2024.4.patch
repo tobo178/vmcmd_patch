@@ -1,0 +1,640 @@
+diff -uprN gromacs-2024.4/api/legacy/include/gromacs/mdtypes/inputrec.h gromacs-2024.4_vmcmd/api/legacy/include/gromacs/mdtypes/inputrec.h
+--- gromacs-2024.4/api/legacy/include/gromacs/mdtypes/inputrec.h	2024-10-31 22:33:20.000000000 +0900
++++ gromacs-2024.4_vmcmd/api/legacy/include/gromacs/mdtypes/inputrec.h	2024-12-27 20:34:44.693202169 +0900
+@@ -47,6 +47,10 @@
+ #define EGP_EXCL (1 << 0)
+ #define EGP_TABLE (1 << 1)
+ 
++/* vmcmd */
++#define MAX_VSTATE 8 // Change here if you want more (or less) vstates.
++#define MAX_POLY 8   // Eighth order of polynomial function is usally sufficent.
++
+ struct gmx_enfrot;
+ struct gmx_enfrotgrp;
+ struct pull_params_t;
+@@ -221,6 +225,22 @@ struct t_expanded
+     std::vector<real> init_lambda_weights;
+ };
+ 
++/* vmcmd */
++struct t_vmcmd 
++{
++    int      n_vstates;                    // nvert
++    int      cur_vs;                       // ivert
++    int      trans_interval;               // nbase
++    double   temperature;                  // tempcev
++    int      seed;                         // iseedjh
++    double   lambda_range[MAX_VSTATE][2];  // celwv, ceupv
++    double   trans_prob[MAX_VSTATE][2];    // tpro
++    int      ord[MAX_VSTATE];              // ndegv
++    double   poly[MAX_VSTATE][MAX_POLY+1]; // cvert
++    double   alpha[MAX_VSTATE][2];         // alphalwv, alphaupv
++    double  *energyList;                   // Potential Energy
++} ;
++
+ struct t_rotgrp
+ {
+     //! Rotation type for this group
+@@ -594,6 +614,10 @@ struct t_inputrec // NOLINT (clang-analy
+ 
+     //! KVT for storing simulation parameters that are not part of the mdp file.
+     std::unique_ptr<gmx::KeyValueTreeObject> internalParameters;
++
++    // vmcmd 
++    bool bVMcMD;       // Do V-McMD ?
++    t_vmcmd* vmcmd;        // V-McMD stuff
+ };
+ 
+ int tcouple_min_integration_steps(TemperatureCoupling etc);
+diff -uprN gromacs-2024.4/share/top/residuetypes.dat gromacs-2024.4_vmcmd/share/top/residuetypes.dat
+--- gromacs-2024.4/share/top/residuetypes.dat	2024-10-31 22:33:20.000000000 +0900
++++ gromacs-2024.4_vmcmd/share/top/residuetypes.dat	2024-12-28 10:05:14.905330869 +0900
+@@ -1,3 +1,8 @@
++BMT	Protein
++SAR	Protein
++MLE	Protein
++DAL	Protein
++MVA	Protein
+ ABU	Protein
+ ACE	Protein
+ AIB	Protein
+diff -uprN gromacs-2024.4/src/gromacs/CMakeLists.txt gromacs-2024.4_vmcmd/src/gromacs/CMakeLists.txt
+--- gromacs-2024.4/src/gromacs/CMakeLists.txt	2024-10-31 22:33:20.000000000 +0900
++++ gromacs-2024.4_vmcmd/src/gromacs/CMakeLists.txt	2024-12-28 08:37:16.695582820 +0900
+@@ -122,6 +122,8 @@ add_subdirectory(coordinateio)
+ add_subdirectory(trajectoryanalysis)
+ add_subdirectory(energyanalysis)
+ add_subdirectory(tools)
++# vmcmd
++add_subdirectory(vmcmd)
+ 
+ get_property(PROPERTY_SOURCES GLOBAL PROPERTY GMX_LIBGROMACS_SOURCES)
+ list(APPEND LIBGROMACS_SOURCES ${GMXLIB_SOURCES} ${MDLIB_SOURCES} ${PROPERTY_SOURCES})
+diff -uprN gromacs-2024.4/src/gromacs/fileio/tpxio.cpp gromacs-2024.4_vmcmd/src/gromacs/fileio/tpxio.cpp
+--- gromacs-2024.4/src/gromacs/fileio/tpxio.cpp	2024-10-31 22:33:20.000000000 +0900
++++ gromacs-2024.4_vmcmd/src/gromacs/fileio/tpxio.cpp	2024-12-27 20:21:49.668575049 +0900
+@@ -78,6 +78,8 @@
+ #include "gromacs/utility/smalloc.h"
+ #include "gromacs/utility/snprintf.h"
+ #include "gromacs/utility/txtdump.h"
++/* vmcmd */
++#include "gromacs/vmcmd/vmcmd.h"
+ 
+ #define TPX_TAG_RELEASE "release"
+ 
+@@ -1568,6 +1570,17 @@ static void do_inputrec(gmx::ISerializer
+         ir->bDoAwh = FALSE;
+     }
+ 
++    /* vmcmd */
++    serializer->doBool(&ir->bVMcMD);
++    if (ir->bVMcMD)
++    {
++      if (serializer->reading())
++	{
++	  snew(ir->vmcmd,1);
++	}
++      vmcmd_io(serializer,ir,ir->vmcmd);
++    }
++
+     /* Enforced rotation */
+     if (file_version >= 74)
+     {
+diff -uprN gromacs-2024.4/src/gromacs/gmxpreprocess/readir.cpp gromacs-2024.4_vmcmd/src/gromacs/gmxpreprocess/readir.cpp
+--- gromacs-2024.4/src/gromacs/gmxpreprocess/readir.cpp	2024-10-31 22:33:20.000000000 +0900
++++ gromacs-2024.4_vmcmd/src/gromacs/gmxpreprocess/readir.cpp	2024-12-30 10:21:59.473843273 +0900
+@@ -91,6 +91,8 @@
+ #include "gromacs/utility/stringcompare.h"
+ #include "gromacs/utility/stringutil.h"
+ #include "gromacs/utility/textwriter.h"
++// vmcmd
++#include "gromacs/vmcmd/vmcmd.h"
+ 
+ #define NOGID 255
+ 
+@@ -115,6 +117,7 @@ struct gmx_inputrec_strings
+     std::vector<std::string>                                               pullGroupNames;
+     std::vector<std::string>                                               rotateGroupNames;
+     char anneal[STRLEN], anneal_npoints[STRLEN], anneal_time[STRLEN], anneal_temp[STRLEN];
++    char vMcMD[STRLEN];
+ };
+ 
+ // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+@@ -1763,6 +1766,12 @@ void check_ir(const char*
+         gmx_fatal(FARGS, "AdResS simulations are no longer supported");
+     }
+ 
++    /* vmcmd */
++    if (ir->bVMcMD && ir->nstcalcenergy != 1)
++    {
++        wi->addError("VMcMD simulation supports only nstcalcenergy = 1");
++    }
++
+     // cosine acceleration is only supported in leap-frog
+     if (ir->cos_accel != 0.0 && ir->eI != IntegrationAlgorithm::MD)
+     {
+@@ -2543,6 +2552,17 @@ void get_ir(const char*     mdparin,
+         ir->awhParams = std::make_unique<gmx::AwhParams>(&inp, wi);
+     }
+ 
++    /* vmcmd */
++    printStringNewline(&inp,"VIRTUAL-SYSTEM COUPLED MULTICANONICAL MD (V-McMD)");
++    printStringNoNewline(&inp,"Do V-McMD: no, yes");
++    ir->bVMcMD = (getEnum<Boolean>(&inp,"do-vmcmd", wi) != Boolean::No);
++
++    if (ir->bVMcMD)
++    {
++      snew(ir->vmcmd, 1);
++      read_vmcmd_params(&inp, ir->vmcmd, wi);
++    }
++
+     /* Enforced rotation */
+     printStringNewline(&inp, "ENFORCED ROTATION");
+     printStringNoNewline(&inp, "Enforced rotation: No or Yes");
+diff -uprN gromacs-2024.4/src/gromacs/mdrun/md.cpp gromacs-2024.4_vmcmd/src/gromacs/mdrun/md.cpp
+--- gromacs-2024.4/src/gromacs/mdrun/md.cpp	2024-10-31 22:33:20.000000000 +0900
++++ gromacs-2024.4_vmcmd/src/gromacs/mdrun/md.cpp	2024-12-28 08:33:13.219538959 +0900
+@@ -156,6 +156,8 @@
+ #include "legacysimulator.h"
+ #include "replicaexchange.h"
+ #include "shellfc.h"
++// vmcmd
++#include "gromacs/vmcmd/vmcmd.h"
+ 
+ using gmx::SimulationSignaller;
+ 
+@@ -847,6 +849,12 @@ void gmx::LegacySimulator::do_md()
+         logInitialMultisimStatus(ms_, cr_, mdLog_, simulationsShareState, ir->nsteps, ir->init_step);
+     }
+ 
++    // vmcmd
++    if (ir->bVMcMD)
++    {
++        vmcmd_init(fpLog_,ir->vmcmd, nFile_, fnm_, enerd_);
++    }
++
+     bool usedMdGpuGraphLastStep = false;
+     /* and stop now if we should */
+     bLastStep = (bLastStep || (ir->nsteps >= 0 && step_rel > ir->nsteps));
+@@ -1277,6 +1285,11 @@ void gmx::LegacySimulator::do_md()
+                          ddBalanceRegionHandler);
+             }
+ 
++	    // vmcmd 
++	    if (ir->bVMcMD) {
++	      apply_vmcmd(ir->vmcmd, mdAtoms_->mdatoms(), &f.view());
++	    }
++
+             // VV integrators do not need the following velocity half step
+             // if it is the first step after starting from a checkpoint.
+             // That is, the half step is needed on all other steps, and
+@@ -2144,6 +2157,12 @@ void gmx::LegacySimulator::do_md()
+     }
+     /* End of main MD loop */
+ 
++    // vmcmd
++    if (ir->bVMcMD)
++    {
++      vmcmd_finish(ir->vmcmd);
++   }
++
+     /* Closing TNG files can include compressing data. Therefore it is good to do that
+      * before stopping the time measurements. */
+     mdoutf_tng_close(outf);
+diff -uprN gromacs-2024.4/src/gromacs/mdtypes/inputrec.cpp gromacs-2024.4_vmcmd/src/gromacs/mdtypes/inputrec.cpp
+--- gromacs-2024.4/src/gromacs/mdtypes/inputrec.cpp	2024-10-31 22:33:20.000000000 +0900
++++ gromacs-2024.4_vmcmd/src/gromacs/mdtypes/inputrec.cpp	2024-12-27 20:21:49.668575049 +0900
+@@ -1063,6 +1063,13 @@ void pr_inputrec(FILE* fp, int indent, c
+             pr_swap(fp, indent, ir->swap);
+         }
+ 
++        /* vmcmd */
++        PS("do-vmcmd", EBOOL(ir->bVMcMD));
++        if (ir->bVMcMD)
++        {
++            PI("vmcmd-seed",ir->vmcmd->seed);
++        }
++
+         /* USER-DEFINED THINGIES */
+         PI("userint1", ir->userint1);
+         PI("userint2", ir->userint2);
+@@ -1605,6 +1612,8 @@ void cmp_inputrec(FILE* fp, const t_inpu
+     cmp_rvec(fp, "inputrec->deform(b)", -1, ir1->deform[YY], ir2->deform[YY], ftol, abstol);
+     cmp_rvec(fp, "inputrec->deform(c)", -1, ir1->deform[ZZ], ir2->deform[ZZ], ftol, abstol);
+ 
++    /* vmcmd */
++    cmp_bool(fp, "ir->bVMcMD", -1, ir1->bVMcMD, ir2->bVMcMD);
+ 
+     cmp_int(fp, "inputrec->userint1", -1, ir1->userint1, ir2->userint1);
+     cmp_int(fp, "inputrec->userint2", -1, ir1->userint2, ir2->userint2);
+diff -uprN gromacs-2024.4/src/gromacs/utility/pleasecite.cpp gromacs-2024.4_vmcmd/src/gromacs/utility/pleasecite.cpp
+--- gromacs-2024.4/src/gromacs/utility/pleasecite.cpp	2024-10-31 22:33:20.000000000 +0900
++++ gromacs-2024.4_vmcmd/src/gromacs/utility/pleasecite.cpp	2024-12-27 20:26:23.042940385 +0900
+@@ -597,6 +597,12 @@ void please_cite(FILE* fp, const char* k
+           0,
+           2024,
+           "0" },
++	{ "Higo2013", "J. Higo, K. Umezawa, H. Nakamura",
++	  "A virtual-system coupled multicanonical molecular dynamics simulation: Principles and applications to free-energy landscape of protein?protein interaction with an all-atom model in explicit solvent",
++	  "J. Chem. Phys.",
++	  138, 
++	  2013, 
++	  "184106" },
+     };
+ #define NSTR static_cast<int>(asize(citedb))
+ 
+diff -uprN gromacs-2024.4/src/gromacs/vmcmd/CMakeLists.txt gromacs-2024.4_vmcmd/src/gromacs/vmcmd/CMakeLists.txt
+--- gromacs-2024.4/src/gromacs/vmcmd/CMakeLists.txt	1970-01-01 09:00:00.000000000 +0900
++++ gromacs-2024.4_vmcmd/src/gromacs/vmcmd/CMakeLists.txt	2024-12-30 10:23:00.556697682 +0900
+@@ -0,0 +1,7 @@
++file(GLOB VMCMD_SOURCES *.cpp)
++
++set(LIBGROMACS_SOURCES ${LIBGROMACS_SOURCES} ${VMCMD_SOURCES} PARENT_SCOPE)
++
++if (BUILD_TESTING)
++#    add_subdirectory(tests)
++endif()
+diff -uprN gromacs-2024.4/src/gromacs/vmcmd/io.cpp gromacs-2024.4_vmcmd/src/gromacs/vmcmd/io.cpp
+--- gromacs-2024.4/src/gromacs/vmcmd/io.cpp	1970-01-01 09:00:00.000000000 +0900
++++ gromacs-2024.4_vmcmd/src/gromacs/vmcmd/io.cpp	2024-12-30 10:33:30.493465279 +0900
+@@ -0,0 +1,119 @@
++/*
++ * TTP-V-McMD: File I/O
++ * This file is written by Satoshi Ono (nca01750@gmail.com)
++ */
++
++#include <assert.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "vmcmd.h"
++
++#include "gromacs/fileio/readinp.h" // printStrinNewline,etc
++#include "gromacs/mdtypes/inputrec.h" // MAX_VSTATE, MAX_POLY
++#include "gromacs/utility/smalloc.h" // snew
++#include "gromacs/utility/cstringutil.h" //STRLEN=4096
++#include "gromacs/utility/fatalerror.h" // gmx_fatal
++#include "gromacs/fileio/gmxfio_xdr.h" // gmx_fio_do_*
++#include "gromacs/topology/topology.h"
++#include "gromacs/utility/inmemoryserializer.h"
++
++/* read setup for V-McMD from gromacs config */
++void read_vmcmd_params(std::vector<t_inpfile>* inp, t_vmcmd *vmcmd,
++                       WarningHandler* wi)
++{
++  char path_file[STRLEN]; path_file[0] = '\0';
++  size_t read_ret;
++  int i,j;
++
++  printStringNewline(inp,"The files which lists the V-McMD parameters");
++  setStringEntry(inp,"vmcmd-param-file", path_file, "");
++
++  if (path_file[0] != '\0')
++  {
++    FILE *fp = fopen(path_file, "r");
++    if (fp == NULL)
++    {
++      gmx_fatal(FARGS, "Can not open V-McMD input file %s", path_file);
++    }
++
++    /* read parameters here. */
++    read_ret = fscanf(fp, "%d", &vmcmd->n_vstates);
++    if (vmcmd->n_vstates > MAX_VSTATE)
++    {
++      gmx_fatal(FARGS, "Number of vstate should be less than or eqaul to %d\n",
++                MAX_VSTATE);
++    }
++    read_ret = fscanf(fp, "%d", &vmcmd->trans_interval);
++
++    for (i=0; i < vmcmd->n_vstates; i++)
++    {
++      read_ret = fscanf(fp, "%lf %lf", 
++                        &vmcmd->lambda_range[i][0],&vmcmd->lambda_range[i][1]);
++      read_ret = fscanf(fp, "%lf %lf", 
++                        &vmcmd->trans_prob[i][0],&vmcmd->trans_prob[i][1]);
++    }
++    for (i=0; i < vmcmd->n_vstates; i++)
++    {
++      read_ret = fscanf(fp,"%d", &vmcmd->ord[i]);
++      if (vmcmd->ord[i] > MAX_POLY)
++      {
++        gmx_fatal(FARGS, "Order of polynomial should be less than or eqaul to %d\n", 
++                  MAX_POLY);
++      }
++      for (j=0; j < vmcmd->ord[i]+1; j++)
++      {
++        read_ret = fscanf(fp, "%lf",&vmcmd->poly[i][j]);
++      }
++      read_ret = fscanf(fp, "%lf", &vmcmd->alpha[i][0]);
++      read_ret = fscanf(fp, "%lf", &vmcmd->alpha[i][1]);
++    }
++    read_ret = fscanf(fp, "%lf", &vmcmd->temperature);
++    fclose(fp);
++  }
++
++  setStringEntry(inp,"vmcmd-start-file", path_file, nullptr);
++
++  if (path_file[0] != 0)
++  {
++    FILE *fp = fopen(path_file, "r");
++    if (fp == NULL)
++    {
++      gmx_fatal(FARGS,"Can not open V-McMD start file %s",path_file);
++    }
++    read_ret = fscanf(fp, "%d", &vmcmd->cur_vs);
++    read_ret = fscanf(fp, "%d", &vmcmd->seed);
++    if (vmcmd->cur_vs < 0 || vmcmd->cur_vs >= MAX_VSTATE)  
++    { /* Should be change if we change the indexing of output current vstate */
++      gmx_fatal(FARGS, "Current vstate out of range");
++    }
++    fclose(fp);
++  }
++  return;
++}
++  
++void vmcmd_io(gmx::ISerializer* serializer, t_inputrec *ir, t_vmcmd *vmcmd)
++{
++  int i,j;
++
++  serializer->doInt(&vmcmd->n_vstates);
++  serializer->doInt(&vmcmd->trans_interval);
++
++  serializer->doDoubleArray((double *)vmcmd->lambda_range, vmcmd->n_vstates*2);
++  serializer->doDoubleArray((double *)vmcmd->trans_prob, vmcmd->n_vstates*2);
++
++  for (i=0; i < vmcmd->n_vstates; i++)
++  {
++    serializer->doInt(&vmcmd->ord[i]);
++    serializer->doDoubleArray((double *)vmcmd->poly[i], vmcmd->ord[i]+1);
++    serializer->doDoubleArray((double *)vmcmd->alpha[i], 2);
++  }
++    
++  serializer->doDouble(&vmcmd->temperature);
++
++  serializer->doInt(&vmcmd->cur_vs);
++  serializer->doInt(&vmcmd->seed);
++
++  snew(vmcmd->energyList, ir->nsteps);
++
++}
+diff -uprN gromacs-2024.4/src/gromacs/vmcmd/vmcmd.cpp gromacs-2024.4_vmcmd/src/gromacs/vmcmd/vmcmd.cpp
+--- gromacs-2024.4/src/gromacs/vmcmd/vmcmd.cpp	1970-01-01 09:00:00.000000000 +0900
++++ gromacs-2024.4_vmcmd/src/gromacs/vmcmd/vmcmd.cpp	2024-12-30 10:33:34.023723079 +0900
+@@ -0,0 +1,211 @@
++/*
++ * TTP-V-McMD: Initialize, Finalize, and Force rescaling.
++ * This file is written by Satoshi Ono (nca01750@gmail.com)
++ */
++
++#include "vmcmd.h"
++#include "gromacs/mdtypes/commrec.h"
++#include <iostream>
++#include <string.h>
++#include "gromacs/utility/pleasecite.h"
++
++struct t_vmcmd_tmp {
++  int t; // icoujh
++  gmx_enerdata_t *enerd;
++  char *energies_fn;
++  char *vmcmd_log_fn;
++  int seed;
++} vmcmd_tmp;
++
++/* */
++void vmcmd_init(FILE* fplog,t_vmcmd *vmcmd, int nfile, const t_filenm fnm[], 
++                gmx_enerdata_t *enerd)
++{
++  const char *energies_ext = ".vmcmd.ene";
++  const char *log_ext = ".vmcmd.log";
++  int i,j;
++  char ene_fn[STRLEN], log_fn[STRLEN];
++  std::string pre(opt2fn("-g",nfile, fnm));
++
++  pre.erase(pre.length()-4);
++  sprintf(ene_fn, "%s%s", pre.c_str(),energies_ext);
++  vmcmd_tmp.energies_fn=(char *)malloc(strlen(ene_fn)+1);
++  strcpy(vmcmd_tmp.energies_fn,ene_fn);
++  sprintf(log_fn, "%s%s", pre.c_str(),log_ext);
++  vmcmd_tmp.vmcmd_log_fn=(char *)malloc(strlen(log_fn)+1);
++  strcpy(vmcmd_tmp.vmcmd_log_fn, log_fn);
++
++  vmcmd_tmp.t = 0;
++  vmcmd_tmp.enerd = enerd;
++
++  vmcmd_tmp.seed = vmcmd->seed;
++  make_backup(vmcmd_tmp.vmcmd_log_fn);
++  FILE *fp = fopen(vmcmd_tmp.vmcmd_log_fn,"w");
++  fprintf(fp, "%d  %d\n", vmcmd_tmp.t, vmcmd->cur_vs);
++  fclose(fp);
++
++  fprintf(fplog, "Initializing V-McMD parameters\n");
++  please_cite(fplog, "Higo2013");
++  fprintf(fplog, "Number of vstates = %d\n",vmcmd->n_vstates);
++  fprintf(fplog, "Transitioin interval = %d\n",vmcmd->trans_interval);
++  fprintf(fplog, "Range of states and transition probabilities\n");
++  for (i=0; i < vmcmd->n_vstates; i++)
++    {
++      fprintf(fplog, "%lf %lf\n", 
++	      vmcmd->lambda_range[i][0],vmcmd->lambda_range[i][1]);
++      fprintf(fplog, "%lf %lf\n", 
++	      vmcmd->trans_prob[i][0],vmcmd->trans_prob[i][1]);
++    }
++  fprintf(fplog, "Polynomial parameters\n");
++  for (i=0; i < vmcmd->n_vstates; i++)
++    {
++      fprintf(fplog,"%d\n",vmcmd->ord[i]);
++      for (j=0; j < vmcmd->ord[i]+1; j++)
++	{
++	  fprintf(fplog, "%E\n",vmcmd->poly[i][j]);
++	}
++      fprintf(fplog, "%E\t", vmcmd->alpha[i][0]);
++      fprintf(fplog, "%E\n", vmcmd->alpha[i][1]);
++    }
++  fprintf(fplog, "temperature = %lf\n", vmcmd->temperature);
++  fprintf(fplog, "End of V-McMD parameters\n\n");
++}
++
++/* */
++void vmcmd_finish(const t_vmcmd *vmcmd)
++{
++  make_backup(vmcmd_tmp.energies_fn);
++  FILE *fp = fopen(vmcmd_tmp.energies_fn, "w");
++//  fwrite(vmcmd->energyList, sizeof(double), vmcmd_tmp.t-1, fp);//20241229
++  fwrite(vmcmd->energyList, sizeof(double), vmcmd_tmp.t, fp);
++  fclose(fp);
++  sfree(vmcmd->energyList);
++}
++
++/* */
++void apply_vmcmd(t_vmcmd *vmcmd, t_mdatoms* md, gmx::ForceBuffersView *f)
++//void apply_vmcmd(t_vmcmd *vmcmd, gmx::MDAtoms *md, gmx::ForceBuffersView *f)
++{
++  double epot, dew, dprobl;
++  real rrprob;
++  int i, kk1, ivout;
++  gmx::ThreeFry2x64<8> rng(vmcmd->seed, gmx::RandomDomain::Other);
++  gmx::UniformRealDistribution<real> dist(0.0,1.0);
++
++  epot = vmcmd_tmp.enerd->term[F_EPOT];
++  vmcmd->energyList[vmcmd_tmp.t] = epot;
++  vmcmd_tmp.t++; 
++
++  if (vmcmd_tmp.t % vmcmd->trans_interval == 0)
++  {
++    /* You can try_move the v move. */
++    if (vmcmd->cur_vs == 0)
++    {
++      int try_move=1;
++      if (epot >= vmcmd->lambda_range[try_move][0]  &&
++          epot <= vmcmd->lambda_range[try_move][1] )
++      {
++	rng.restart(vmcmd->seed,vmcmd_tmp.t);
++	rrprob = dist(rng);
++        if (rrprob >= 1.0-vmcmd->trans_prob[vmcmd->cur_vs][1])
++          vmcmd->cur_vs = try_move;
++      }
++    }
++    else if (vmcmd->cur_vs == vmcmd->n_vstates-1)
++    {
++      int try_move = vmcmd->n_vstates-2;
++      if (epot >= vmcmd->lambda_range[try_move][0]  &&
++          epot <= vmcmd->lambda_range[try_move][1] )
++      {
++	rng.restart(vmcmd->seed,vmcmd_tmp.t);
++        rrprob = dist(rng);
++        if (rrprob >= 1.0-vmcmd->trans_prob[vmcmd->cur_vs][0])
++          vmcmd->cur_vs = try_move;
++      }
++    }
++    else
++    {
++      int try_move= vmcmd->cur_vs -1;
++      int ijdg1=0, ijdg2=0;
++      if (epot >= vmcmd->lambda_range[try_move][0]  &&
++          epot <= vmcmd->lambda_range[try_move][1] ) ijdg1=1;
++      try_move = vmcmd->cur_vs +1;
++      if (epot >= vmcmd->lambda_range[try_move][0]  &&
++          epot <= vmcmd->lambda_range[try_move][1] ) ijdg2=1;
++
++      if (ijdg1 == 1 && ijdg2 == 0 )
++      {
++	rng.restart(vmcmd->seed,vmcmd_tmp.t);
++        rrprob = dist(rng);
++        if (rrprob >= 1.0-vmcmd->trans_prob[vmcmd->cur_vs][0])
++        {
++          vmcmd->cur_vs--;
++        }
++      }
++      else if (ijdg1 == 0 && ijdg2 == 1 )
++      {
++	rng.restart(vmcmd->seed,vmcmd_tmp.t);
++        rrprob = dist(rng);
++        if (rrprob >= 1.0-vmcmd->trans_prob[vmcmd->cur_vs][1])
++        {
++          vmcmd->cur_vs++;
++        }
++      }
++      else if (ijdg1 == 1 && ijdg2 == 1 )
++      {
++        /* This case does not usually happned in my setting of v states. */
++        real randjh = dist(rng);
++        if (randjh < 0.5)
++        {
++	  rng.restart(vmcmd->seed,vmcmd_tmp.t);
++          rrprob = dist(rng);
++          if (rrprob >= 1.0-vmcmd->trans_prob[vmcmd->cur_vs][0])
++          {
++            vmcmd->cur_vs--;
++          }
++        }
++        else
++        {
++	  rng.restart(vmcmd->seed,vmcmd_tmp.t);
++          rrprob = dist(rng);
++          if (rrprob >= 1.0-vmcmd->trans_prob[vmcmd->cur_vs][1])
++          {
++            vmcmd->cur_vs++;
++          }
++        }
++      }
++    }
++    
++    FILE *fp = fopen(vmcmd_tmp.vmcmd_log_fn,"a");
++    fprintf(fp, "%d  %d\n", vmcmd_tmp.t, vmcmd->cur_vs);
++    fclose(fp);
++  }
++  
++  double param=epot;
++  if (epot <= vmcmd->lambda_range[vmcmd->cur_vs][0])
++  { /* In going below the lower limit. */
++    param=vmcmd->lambda_range[vmcmd->cur_vs][0];
++  }
++  else if (epot >= vmcmd->lambda_range[vmcmd->cur_vs][1]) 
++  { /* In going above the upper limit. */
++    param=vmcmd->lambda_range[vmcmd->cur_vs][1];
++  }
++  double tmp_lambda = 1.0;
++  dprobl = vmcmd->poly[vmcmd->cur_vs][0];
++  for (i=1; i <=vmcmd->ord[vmcmd->cur_vs]; i++)
++  {
++    tmp_lambda *= param;
++    dprobl += vmcmd->poly[vmcmd->cur_vs][i] * tmp_lambda;
++  }
++
++  dew = gmx::c_boltz * vmcmd->temperature * dprobl;
++
++  /* scale the force */
++//  for (i = 0; i < md->mdatoms()->homenr; i++)
++  for (i = 0; i < md->homenr; i++)
++  {
++     f->force()[i][0] *= dew;
++     f->force()[i][1] *= dew;
++     f->force()[i][2] *= dew; 
++  }
++}
+diff -uprN gromacs-2024.4/src/gromacs/vmcmd/vmcmd.h gromacs-2024.4_vmcmd/src/gromacs/vmcmd/vmcmd.h
+--- gromacs-2024.4/src/gromacs/vmcmd/vmcmd.h	1970-01-01 09:00:00.000000000 +0900
++++ gromacs-2024.4_vmcmd/src/gromacs/vmcmd/vmcmd.h	2024-12-30 10:33:37.342188655 +0900
+@@ -0,0 +1,42 @@
++/*
++ * TTP-V-McMD:
++ * This file is written by Satoshi Ono (nca01750@gmail.com)
++ */
++
++#ifndef GMX_VMCMD_H
++#define GMX_VMCMD_H
++
++#include "gromacs/fileio/readinp.h"
++#include "gromacs/utility/cstringutil.h"
++#include "gromacs/math/vec.h"
++#include "gromacs/topology/index.h"
++#include "gromacs/mdtypes/mdatom.h"
++#include "gromacs/commandline/filenm.h"
++#include "gromacs/mdtypes/enerdata.h"
++#include "gromacs/mdtypes/inputrec.h"
++#include "gromacs/utility/inmemoryserializer.h"
++#include "gromacs/mdtypes/state.h"
++#include "gromacs/options/filenameoption.h"
++#include "gromacs/mdtypes/forcerec.h"
++#include "gromacs/mdtypes/forcebuffers.h"
++#include "gromacs/fileio/gmxfio.h"
++#include "gromacs/math/units.h"
++#include "gromacs/random/exponentialdistribution.h"
++#include "gromacs/random/gammadistribution.h"
++#include "gromacs/random/normaldistribution.h"
++#include "gromacs/random/seed.h"
++#include "gromacs/random/threefry.h"
++#include "gromacs/random/uniformintdistribution.h"
++#include "gromacs/random/uniformrealdistribution.h"
++#include "gromacs/fileio/warninp.h"
++
++
++void vmcmd_init(FILE* fplog, t_vmcmd *vmcmd, int nfile, const t_filenm fnm[], 
++                gmx_enerdata_t *enerd);
++void vmcmd_finish(const t_vmcmd *vmcmd);
++void read_vmcmd_params(std::vector<t_inpfile>* inp, t_vmcmd *vmcmd, WarningHandler* wi);
++//void apply_vmcmd(t_vmcmd *vmcmd, gmx::MDAtoms *md, gmx::ForceBuffersView *f);
++void apply_vmcmd(t_vmcmd *vmcmd, t_mdatoms *mdatoms, gmx::ForceBuffersView *f);
++void vmcmd_io(gmx::ISerializer* serializer, t_inputrec *ir, t_vmcmd *vmcmd);
++
++#endif
